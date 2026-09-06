@@ -1,4 +1,4 @@
-"""Safety-first dry-run comparison and update strategy implementation for Ageroot.
+"""Safety-first dry-run comparison and update engine implementation for Ageroot.
 
 This module implements:
 1. ResultClass vocabulary & apply eligibility rules.
@@ -9,16 +9,22 @@ This module implements:
 6. External-link target resolution validation.
 7. Deletion escalation and modified-deletion gating.
 8. Tiered summary-first confirmation report.
-9. Atomic apply with transactional snapshot commit.
+9. Pre-apply workspace drift check.
+10. Staged two-phase transactional snapshot commit with rollback.
+11. Stdlib-only YAML parser/serializer for config and state.
+12. AgerootUpdateEngine unified interface.
 """
 
+import copy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import os
 from pathlib import Path
 import re
-from typing import Dict, List, Optional, Set, Tuple
+import shutil
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 
 class ResultClass(str, Enum):
@@ -69,6 +75,266 @@ class ComparisonResult:
         return self.result_class.is_eligible_for_apply
 
 
+@dataclass
+class DryRunOptions:
+    one_time_unverified_override: bool = False
+    allow_deletions: bool = False
+    expected_link_targets: Optional[Dict[str, str]] = None
+
+
+@dataclass
+class DryRunReport:
+    results: Dict[str, ComparisonResult]
+    workspace_hashes: Dict[str, Optional[str]]
+    renders: Dict[str, str]
+    options: DryRunOptions
+    config: dict
+    state: dict
+
+    @property
+    def is_eligible(self) -> bool:
+        """Whether atomic apply can proceed under the current options."""
+        for r in self.results.values():
+            if r.excluded:
+                continue
+            if r.result_class == ResultClass.DELETION_PENDING:
+                if not self.options.allow_deletions:
+                    return False
+            elif not r.is_eligible:
+                return False
+        return True
+
+    @property
+    def summary(self) -> str:
+        return SummaryReport.format_summary(self)
+
+    def __getitem__(self, path: str) -> ComparisonResult:
+        return self.results[path]
+
+    def __iter__(self):
+        return iter(self.results.values())
+
+    def get(self, path: str, default=None):
+        return self.results.get(path, default)
+
+
+@dataclass
+class ApplyOptions:
+    allow_deletions: bool = False
+
+
+@dataclass
+class ApplyOutcome:
+    success: bool
+    applied_paths: List[str] = field(default_factory=list)
+    deleted_paths: List[str] = field(default_factory=list)
+    skipped_paths: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+    staging_dir: Optional[Path] = None
+
+
+class SimpleYamlHelper:
+    """Standard-library-only YAML parser and dumper for Ageroot config and state files."""
+
+    @staticmethod
+    def _parse_scalar(val: str):
+        val = val.strip()
+        if not val:
+            return ""
+        if val in ("[]", "[ ]"):
+            return []
+        if val in ("{}", "{ }"):
+            return {}
+        if val.lower() in ("null", "~"):
+            return None
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            return val[1:-1].replace("''", "'")
+        if val.lower() == "true":
+            return True
+        if val.lower() == "false":
+            return False
+        if val.isdigit():
+            return int(val)
+        return val
+
+    @classmethod
+    def parse(cls, text: str) -> dict:
+        lines = []
+        for raw_line in text.splitlines():
+            # Strip comments outside quotes
+            in_quotes = False
+            quote_char = None
+            comment_idx = -1
+            for i, ch in enumerate(raw_line):
+                if ch in ('"', "'"):
+                    if not in_quotes:
+                        in_quotes = True
+                        quote_char = ch
+                    elif quote_char == ch:
+                        in_quotes = False
+                elif ch == "#" and not in_quotes:
+                    comment_idx = i
+                    break
+            clean_line = raw_line[:comment_idx] if comment_idx != -1 else raw_line
+            if clean_line.strip():
+                indent = len(clean_line) - len(clean_line.lstrip())
+                lines.append((indent, clean_line.strip()))
+
+        def parse_block(idx: int, current_indent: int):
+            if idx >= len(lines):
+                return {}, idx
+
+            first_indent, first_line = lines[idx]
+            if first_line.startswith("- ") or first_line == "-":
+                items = []
+                while idx < len(lines):
+                    indent, line = lines[idx]
+                    if indent < current_indent:
+                        break
+                    if line.startswith("- ") or line == "-":
+                        item_text = line[2:].strip()
+                        idx += 1
+                        if item_text and ":" in item_text:
+                            item_dict = {}
+                            k, v = item_text.split(":", 1)
+                            k = k.strip()
+                            v = v.strip()
+                            if v:
+                                item_dict[k] = cls._parse_scalar(v)
+                            else:
+                                val, idx = parse_block(idx, indent + 2)
+                                item_dict[k] = val
+                            child_indent = indent + 2
+                            while idx < len(lines):
+                                c_indent, c_line = lines[idx]
+                                if c_indent < child_indent or c_line.startswith("-"):
+                                    break
+                                if ":" in c_line:
+                                    ck, cv = c_line.split(":", 1)
+                                    ck = ck.strip()
+                                    cv = cv.strip()
+                                    idx += 1
+                                    if cv:
+                                        item_dict[ck] = cls._parse_scalar(cv)
+                                    else:
+                                        cval, idx = parse_block(idx, c_indent + 2)
+                                        item_dict[ck] = cval
+                                else:
+                                    idx += 1
+                            items.append(item_dict)
+                        elif item_text:
+                            items.append(cls._parse_scalar(item_text))
+                        else:
+                            val, idx = parse_block(idx, indent + 2)
+                            items.append(val)
+                    else:
+                        break
+                return items, idx
+            else:
+                d = {}
+                while idx < len(lines):
+                    indent, line = lines[idx]
+                    if indent < current_indent:
+                        break
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        k = k.strip()
+                        v = v.strip()
+                        idx += 1
+                        if v:
+                            d[k] = cls._parse_scalar(v)
+                        else:
+                            if idx < len(lines):
+                                next_indent, next_line = lines[idx]
+                                if next_indent > indent or (next_indent >= indent and next_line.startswith("-")):
+                                    val, idx = parse_block(idx, next_indent)
+                                    d[k] = val
+                                else:
+                                    d[k] = None
+                            else:
+                                d[k] = None
+                    else:
+                        idx += 1
+                return d, idx
+
+        parsed, _ = parse_block(0, 0)
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def dump(cls, data: dict) -> str:
+        lines = []
+
+        def _format_scalar(v) -> str:
+            if v is None:
+                return "null"
+            if isinstance(v, bool):
+                return str(v).lower()
+            if isinstance(v, int):
+                return str(v)
+            s = str(v)
+            if (
+                any(c in s for c in [":", "{", "}", "[", "]", ",", "&", "*", "#", "?", "|", "<", ">", "=", "!", "%", "@", "`", "\n"])
+                or s == ""
+                or s.lower() in ("true", "false", "null", "~")
+                or s.isdigit()
+            ):
+                escaped = s.replace("'", "''")
+                return f"'{escaped}'"
+            return s
+
+        def _dump_item(val, indent_level=0):
+            prefix = "  " * indent_level
+            if isinstance(val, dict):
+                for k, v in val.items():
+                    if isinstance(v, list):
+                        if not v:
+                            lines.append(f"{prefix}{k}: []")
+                        else:
+                            lines.append(f"{prefix}{k}:")
+                            _dump_item(v, indent_level + 1)
+                    elif isinstance(v, dict):
+                        if not v:
+                            lines.append(f"{prefix}{k}: {{}}")
+                        else:
+                            lines.append(f"{prefix}{k}:")
+                            _dump_item(v, indent_level + 1)
+                    elif v is None:
+                        lines.append(f"{prefix}{k}: null")
+                    elif isinstance(v, bool):
+                        lines.append(f"{prefix}{k}: {str(v).lower()}")
+                    elif isinstance(v, int):
+                        lines.append(f"{prefix}{k}: {v}")
+                    else:
+                        lines.append(f"{prefix}{k}: {_format_scalar(v)}")
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        if not item:
+                            lines.append(f"{prefix}- {{}}")
+                            continue
+                        first = True
+                        for k, v in item.items():
+                            if first:
+                                if isinstance(v, (dict, list)):
+                                    lines.append(f"{prefix}- {k}:")
+                                    _dump_item(v, indent_level + 2)
+                                else:
+                                    lines.append(f"{prefix}- {k}: {_format_scalar(v)}")
+                                first = False
+                            else:
+                                sub_prefix = "  " * (indent_level + 1)
+                                if isinstance(v, (dict, list)):
+                                    lines.append(f"{sub_prefix}{k}:")
+                                    _dump_item(v, indent_level + 2)
+                                else:
+                                    lines.append(f"{sub_prefix}{k}: {_format_scalar(v)}")
+                    else:
+                        lines.append(f"{prefix}- {_format_scalar(item)}")
+
+        _dump_item(data)
+        return "\n".join(lines) + "\n"
+
+
 class DeterministicNormalizer:
     """Normalizes content deterministically before comparison.
     
@@ -95,7 +361,7 @@ class DeterministicNormalizer:
         # 3. Collapse 3+ consecutive newlines to at most 2 (standard markdown/yaml formatter normalization)
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
 
-        # 4. Generated-file provenance is metadata, not managed content.  A
+        # 4. Generated-file provenance is metadata, not managed content. A
         # version/commit/timestamp-only change must not create an update.
         normalized = re.sub(
             r"<!-- generated-by: ageroot; template: [^;]+; commit: [^;]+; rendered-at: [^>]+ -->",
@@ -119,7 +385,8 @@ class SnapshotStore:
         self.snapshot_dir = snapshot_dir or (self.root_dir / ".agents" / "snapshots")
 
     def get_snapshot_path(self, relative_path: str) -> Path:
-        return self.snapshot_dir / relative_path
+        clean = relative_path.removeprefix("./")
+        return self.snapshot_dir / clean
 
     @staticmethod
     def compute_sha256(content: str) -> str:
@@ -180,8 +447,6 @@ class ManagedRegionParser:
         segments = []
         open_stack = []
         current_segment_lines = []
-        current_kind = "unmanaged"
-        current_name = None
 
         line_idx = 0
         while line_idx < len(lines):
@@ -327,11 +592,12 @@ class ThreeWayComparisonEngine:
         one_time_unverified_override: bool = False,
         expected_link_target: Optional[str] = None,
     ) -> ComparisonResult:
-        target_file = self.root_dir / relative_path
+        clean_rel = relative_path.removeprefix("./")
+        target_file = self.root_dir / clean_rel
 
-        # Planning belongs to the planning-with-files skill.  It is never a
+        # Planning belongs to the planning-with-files skill. It is never a
         # managed Ageroot path and must not affect comparison or reporting.
-        if Path(relative_path).parts and Path(relative_path).parts[0] == ".planning":
+        if Path(clean_rel).parts and Path(clean_rel).parts[0] == ".planning":
             return ComparisonResult(
                 path=relative_path,
                 strategy=strategy,
@@ -601,13 +867,23 @@ class SummaryReport:
     """Generates tiered confirmation summary following ADR-0001."""
 
     @staticmethod
-    def format_summary(results: List[ComparisonResult]) -> str:
-        results = [result for result in results if not result.excluded]
-        counts: Dict[ResultClass, int] = {rc: 0 for rc in ResultClass}
-        for r in results:
-            counts[r.result_class] += 1
+    def format_summary(
+        report_or_results: Union[DryRunReport, List[ComparisonResult], Dict[str, ComparisonResult]]
+    ) -> str:
+        if isinstance(report_or_results, DryRunReport):
+            results_list = list(report_or_results.results.values())
+            overall_eligible = report_or_results.is_eligible
+        elif isinstance(report_or_results, dict):
+            results_list = list(report_or_results.values())
+            overall_eligible = all(r.is_eligible for r in results_list if not r.excluded)
+        else:
+            results_list = list(report_or_results)
+            overall_eligible = all(r.is_eligible for r in results_list if not r.excluded)
 
-        all_eligible = all(r.is_eligible for r in results)
+        results_list = [result for result in results_list if not result.excluded]
+        counts: Dict[ResultClass, int] = {rc: 0 for rc in ResultClass}
+        for r in results_list:
+            counts[r.result_class] += 1
 
         lines = [
             "# Dry-Run Comparison Summary",
@@ -622,13 +898,15 @@ class SummaryReport:
             f"- Invalid Links: {counts[ResultClass.INVALID_LINK]}",
             f"- Deletion Pending: {counts[ResultClass.DELETION_PENDING]}",
             "",
-            f"**Atomic Apply Status**: {'ELIGIBLE' if all_eligible else 'BLOCKED'}",
+            f"**Atomic Apply Status**: {'ELIGIBLE' if overall_eligible else 'BLOCKED'}",
             "",
         ]
 
         issues = [
-            r for r in results
-            if not r.is_eligible or r.result_class == ResultClass.UNVERIFIED or r.warnings
+            r for r in results_list
+            if not r.is_eligible
+            or r.result_class in (ResultClass.UNVERIFIED, ResultClass.DELETION_PENDING)
+            or r.warnings
         ]
 
         if issues:
@@ -647,3 +925,493 @@ class SummaryReport:
 
         return "\n".join(lines)
 
+
+def format_summary(report: Union[DryRunReport, List[ComparisonResult], Dict[str, ComparisonResult]]) -> str:
+    """Format tiered summary-first confirmation report."""
+    return SummaryReport.format_summary(report)
+
+
+class AgerootUpdateEngine:
+    """Unified safety-first update engine for Ageroot.
+    
+    Coordinates configuration/state loading, strategy resolution, three-way comparisons,
+    workspace drift checks, and staged two-phase transactional snapshot commits.
+    """
+
+    def __init__(
+        self,
+        root_dir: Path,
+        config_path: Optional[Path] = None,
+        state_path: Optional[Path] = None,
+    ):
+        self.root_dir = Path(root_dir).resolve()
+        self.config_path = (
+            Path(config_path).resolve()
+            if config_path
+            else (self.root_dir / ".agents" / "ageroot.config.yaml")
+        )
+        self.state_path = (
+            Path(state_path).resolve()
+            if state_path
+            else (self.root_dir / ".agents" / "ageroot.state.yaml")
+        )
+        self._load_config_and_state()
+
+    def _load_config_and_state(self) -> None:
+        """Loads configuration and state from disk or initializes defaults."""
+        if self.config_path.exists() and self.config_path.is_file():
+            try:
+                self.config = SimpleYamlHelper.parse(self.config_path.read_text(encoding="utf-8"))
+            except Exception:
+                self.config = {"schema": 1, "snapshots": "enabled"}
+        else:
+            self.config = {"schema": 1, "snapshots": "enabled"}
+
+        if self.state_path.exists() and self.state_path.is_file():
+            try:
+                self.state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+            except Exception:
+                self.state = {
+                    "schema": 1,
+                    "template": {
+                        "name": "ageroot",
+                        "version": "unknown",
+                        "source": "unknown",
+                        "commit": "unknown",
+                    },
+                    "installed_at": None,
+                    "rendered_at": None,
+                    "managed_files": [],
+                }
+        else:
+            self.state = {
+                "schema": 1,
+                "template": {
+                    "name": "ageroot",
+                    "version": "unknown",
+                    "source": "unknown",
+                    "commit": "unknown",
+                },
+                "installed_at": None,
+                "rendered_at": None,
+                "managed_files": [],
+            }
+
+        if not isinstance(self.state.get("managed_files"), list):
+            self.state["managed_files"] = []
+
+        self.snapshots_enabled = (self.config.get("snapshots", "enabled") != "disabled")
+        self.snapshot_store = SnapshotStore(self.root_dir)
+        self.comparison_engine = ThreeWayComparisonEngine(
+            self.root_dir,
+            snapshots_enabled=self.snapshots_enabled,
+            snapshot_store=self.snapshot_store,
+        )
+
+    @staticmethod
+    def _normalize_rel_path(path_str: str) -> str:
+        p = Path(path_str).as_posix()
+        if p.startswith("./"):
+            p = p[2:]
+        return p
+
+    def dry_run(
+        self,
+        renders: dict[str, str],
+        options: Optional[DryRunOptions] = None,
+    ) -> DryRunReport:
+        """Performs strategy-aware safety-first dry-run comparison over new renders."""
+        self._load_config_and_state()
+        opts = options or DryRunOptions()
+
+        # Build index of existing managed files from state
+        state_files_map: Dict[str, dict] = {}
+        for entry in self.state.get("managed_files", []):
+            if isinstance(entry, dict) and "path" in entry:
+                p_norm = self._normalize_rel_path(entry["path"])
+                state_files_map[p_norm] = entry
+                if p_norm.endswith("/"):
+                    state_files_map[p_norm.rstrip("/")] = entry
+
+        results: Dict[str, ComparisonResult] = {}
+        processed_state_paths: Set[str] = set()
+
+        # 1. Process all paths provided in renders
+        for rel_path, content in renders.items():
+            clean_rel = self._normalize_rel_path(rel_path)
+
+            # Exclude .planning paths completely
+            if Path(clean_rel).parts and Path(clean_rel).parts[0] == ".planning":
+                results[rel_path] = ComparisonResult(
+                    path=rel_path,
+                    strategy=Strategy.GENERATED,
+                    result_class=ResultClass.UNCHANGED,
+                    reason="Excluded planning-with-files state",
+                    excluded=True,
+                )
+                continue
+
+            state_entry = state_files_map.get(clean_rel) or state_files_map.get(clean_rel.rstrip("/"))
+            if state_entry:
+                processed_state_paths.add(self._normalize_rel_path(state_entry.get("path", clean_rel)))
+                strategy_str = state_entry.get("strategy", "generated")
+                try:
+                    strategy = Strategy(strategy_str)
+                except ValueError:
+                    strategy = Strategy.GENERATED
+            else:
+                # New path: auto-detect region markers or default to generated
+                if ManagedRegionParser.MARKER_PATTERN.search(content):
+                    strategy = Strategy.MANAGED_REGIONS
+                else:
+                    strategy = Strategy.GENERATED
+
+            if strategy == Strategy.EXTERNAL_LINK:
+                expected_target = None
+                if opts.expected_link_targets:
+                    expected_target = opts.expected_link_targets.get(rel_path) or opts.expected_link_targets.get(clean_rel)
+                if not expected_target and state_entry:
+                    expected_target = state_entry.get("target")
+
+                results[rel_path] = self.comparison_engine.compare_path(
+                    rel_path,
+                    Strategy.EXTERNAL_LINK,
+                    new_render_content=None,
+                    state_entry=state_entry,
+                    expected_link_target=expected_target,
+                )
+            else:
+                results[rel_path] = self.comparison_engine.compare_path(
+                    rel_path,
+                    strategy,
+                    new_render_content=content,
+                    state_entry=state_entry,
+                    one_time_unverified_override=opts.one_time_unverified_override,
+                )
+
+        # 2. Process managed files in state that were not included in renders
+        for entry in self.state.get("managed_files", []):
+            if not isinstance(entry, dict) or "path" not in entry:
+                continue
+            raw_path = entry["path"]
+            clean_path = self._normalize_rel_path(raw_path)
+            if clean_path in processed_state_paths or clean_path in results or raw_path in results:
+                continue
+
+            strategy_str = entry.get("strategy", "generated")
+            try:
+                strategy = Strategy(strategy_str)
+            except ValueError:
+                strategy = Strategy.GENERATED
+
+            if strategy == Strategy.EXTERNAL_LINK:
+                # State-driven external link validation; never treated as deletion
+                expected_target = None
+                if opts.expected_link_targets:
+                    expected_target = opts.expected_link_targets.get(raw_path) or opts.expected_link_targets.get(clean_path)
+                if not expected_target:
+                    expected_target = entry.get("target")
+
+                results[raw_path] = self.comparison_engine.compare_path(
+                    raw_path,
+                    Strategy.EXTERNAL_LINK,
+                    new_render_content=None,
+                    state_entry=entry,
+                    expected_link_target=expected_target,
+                )
+            else:
+                # Renderer-owned path absent from renders -> potential deletion
+                results[raw_path] = self.comparison_engine.compare_path(
+                    raw_path,
+                    strategy,
+                    new_render_content=None,
+                    state_entry=entry,
+                )
+
+        # 3. Collect workspace file hashes for drift verification
+        workspace_hashes: Dict[str, Optional[str]] = {}
+        for path in results.keys():
+            clean = self._normalize_rel_path(path)
+            target = self.root_dir / clean
+            if target.is_symlink() or (target.exists() and target.is_dir()):
+                workspace_hashes[path] = "symlink" if target.is_symlink() else "dir"
+            elif target.exists() and target.is_file():
+                try:
+                    workspace_hashes[path] = hashlib.sha256(target.read_bytes()).hexdigest()
+                except Exception:
+                    workspace_hashes[path] = None
+            else:
+                workspace_hashes[path] = None
+
+        return DryRunReport(
+            results=results,
+            workspace_hashes=workspace_hashes,
+            renders=renders,
+            options=opts,
+            config=self.config,
+            state=self.state,
+        )
+
+    def apply(
+        self,
+        report: DryRunReport,
+        options: Optional[ApplyOptions] = None,
+    ) -> ApplyOutcome:
+        """Executes atomic apply with staged two-phase transactional snapshot commit."""
+        opts = options or ApplyOptions(allow_deletions=report.options.allow_deletions)
+
+        # 1. Eligibility Check
+        for r in report.results.values():
+            if r.excluded:
+                continue
+            if r.result_class == ResultClass.DELETION_PENDING:
+                if not opts.allow_deletions:
+                    return ApplyOutcome(
+                        success=False,
+                        error=f"Update blocked: deletion pending for '{r.path}' requires explicit confirmation (allow_deletions=True)",
+                    )
+            elif not r.is_eligible:
+                return ApplyOutcome(
+                    success=False,
+                    error=f"Update blocked: path '{r.path}' has ineligible status '{r.result_class.value}' ({r.reason})",
+                )
+
+        # 2. Workspace Drift Check
+        for rel_path, expected_hash in report.workspace_hashes.items():
+            clean = self._normalize_rel_path(rel_path)
+            target_file = self.root_dir / clean
+            if expected_hash is None:
+                if target_file.exists():
+                    return ApplyOutcome(
+                        success=False,
+                        error=f"Workspace drift detected for '{rel_path}': file was created after dry-run",
+                    )
+            elif expected_hash in ("symlink", "dir"):
+                if not target_file.exists() and not target_file.is_symlink():
+                    return ApplyOutcome(
+                        success=False,
+                        error=f"Workspace drift detected for '{rel_path}': target missing after dry-run",
+                    )
+            else:
+                if not target_file.exists():
+                    return ApplyOutcome(
+                        success=False,
+                        error=f"Workspace drift detected for '{rel_path}': file was deleted after dry-run",
+                    )
+                try:
+                    actual_hash = hashlib.sha256(target_file.read_bytes()).hexdigest()
+                except Exception as e:
+                    return ApplyOutcome(
+                        success=False,
+                        error=f"Workspace drift check failed to read '{rel_path}': {e}",
+                    )
+                if actual_hash != expected_hash:
+                    return ApplyOutcome(
+                        success=False,
+                        error=f"Workspace drift detected for '{rel_path}': file modified after dry-run (hash mismatch)",
+                    )
+
+        # 3. Two-Phase Transactional Staged Commit
+        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        staging_dir = self.root_dir / ".agents" / f".staging-{timestamp_str}"
+        stage_workspace = staging_dir / "workspace"
+        stage_snapshots = staging_dir / "snapshots"
+        stage_backup = staging_dir / "backup"
+
+        try:
+            stage_workspace.mkdir(parents=True, exist_ok=True)
+            stage_snapshots.mkdir(parents=True, exist_ok=True)
+
+            applied_paths: List[str] = []
+            deleted_paths: List[str] = []
+            skipped_paths: List[str] = []
+
+            # Phase 1: Stage and verify SHA-256
+            for r in report.results.values():
+                if r.excluded or r.result_class == ResultClass.UNCHANGED:
+                    skipped_paths.append(r.path)
+                    continue
+
+                if r.result_class in (ResultClass.CHANGED, ResultClass.UNVERIFIED, ResultClass.REGION_MERGE):
+                    clean_rel = self._normalize_rel_path(r.path)
+                    staged_ws_file = stage_workspace / clean_rel
+                    staged_ws_file.parent.mkdir(parents=True, exist_ok=True)
+                    content = r.proposed_content or ""
+                    staged_ws_file.write_text(content, encoding="utf-8")
+
+                    ws_sha = hashlib.sha256(staged_ws_file.read_bytes()).hexdigest()
+                    expected_ws_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    if ws_sha != expected_ws_sha:
+                        raise RuntimeError(f"Staged file SHA-256 verification failed for '{r.path}'")
+
+                    if self.snapshots_enabled and r.new_snapshot_content is not None:
+                        staged_snap_file = stage_snapshots / clean_rel
+                        staged_snap_file.parent.mkdir(parents=True, exist_ok=True)
+                        snap_content = r.new_snapshot_content
+                        staged_snap_file.write_text(snap_content, encoding="utf-8")
+                        snap_sha = hashlib.sha256(staged_snap_file.read_bytes()).hexdigest()
+                        expected_snap_sha = r.new_snapshot_sha256 or hashlib.sha256(snap_content.encode("utf-8")).hexdigest()
+                        if snap_sha != expected_snap_sha:
+                            raise RuntimeError(f"Staged snapshot SHA-256 verification failed for '{r.path}'")
+
+                    applied_paths.append(r.path)
+
+                elif r.result_class == ResultClass.DELETION_PENDING and opts.allow_deletions:
+                    deleted_paths.append(r.path)
+
+            # Construct updated state dictionary
+            now = datetime.now(timezone.utc)
+            new_state = copy.deepcopy(self.state)
+            new_state["rendered_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            existing_managed_map: Dict[str, dict] = {
+                self._normalize_rel_path(item["path"]): item
+                for item in self.state.get("managed_files", [])
+                if isinstance(item, dict) and "path" in item
+            }
+
+            deleted_clean_set = {self._normalize_rel_path(p) for p in deleted_paths}
+            updated_managed_files = []
+
+            for r in report.results.values():
+                if r.excluded:
+                    continue
+                clean_rel = self._normalize_rel_path(r.path)
+                if clean_rel in deleted_clean_set:
+                    continue
+
+                entry: dict = {"path": r.path, "strategy": r.strategy.value}
+                if r.strategy != Strategy.EXTERNAL_LINK:
+                    entry["snapshot"] = f".agents/snapshots/{clean_rel}"
+                    if r.new_snapshot_sha256:
+                        entry["sha256"] = r.new_snapshot_sha256
+                    elif clean_rel in existing_managed_map and "sha256" in existing_managed_map[clean_rel]:
+                        entry["sha256"] = existing_managed_map[clean_rel]["sha256"]
+                else:
+                    if clean_rel in existing_managed_map and "target" in existing_managed_map[clean_rel]:
+                        entry["target"] = existing_managed_map[clean_rel]["target"]
+
+                updated_managed_files.append(entry)
+
+            # Retain any prior managed files that were uninspected and not deleted
+            seen_clean = {self._normalize_rel_path(e["path"]) for e in updated_managed_files}
+            for clean_p, old_entry in existing_managed_map.items():
+                if clean_p not in seen_clean and clean_p not in deleted_clean_set:
+                    updated_managed_files.append(old_entry)
+
+            new_state["managed_files"] = updated_managed_files
+
+            # Stage state file
+            staged_state_file = staging_dir / "ageroot.state.yaml"
+            staged_state_content = SimpleYamlHelper.dump(new_state)
+            staged_state_file.write_text(staged_state_content, encoding="utf-8")
+            state_sha = hashlib.sha256(staged_state_file.read_bytes()).hexdigest()
+            expected_state_sha = hashlib.sha256(staged_state_content.encode("utf-8")).hexdigest()
+            if state_sha != expected_state_sha:
+                raise RuntimeError("Staged state file SHA-256 verification failed")
+
+            # Phase 2: Transactional commit with backup and atomic moves
+            stage_backup.mkdir(parents=True, exist_ok=True)
+            # Tuple: (destination_path, backup_path_or_None, existed_previously)
+            moved_records: List[Tuple[Path, Optional[Path], bool]] = []
+
+            try:
+                # 1. Atomically move workspace files
+                for rel_path in applied_paths:
+                    clean_rel = self._normalize_rel_path(rel_path)
+                    src_file = stage_workspace / clean_rel
+                    dst_file = self.root_dir / clean_rel
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    if dst_file.exists():
+                        backup_file = stage_backup / "ws" / clean_rel
+                        backup_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(dst_file, backup_file)
+                        moved_records.append((dst_file, backup_file, True))
+                    else:
+                        moved_records.append((dst_file, None, False))
+                    src_file.replace(dst_file)
+
+                # 2. Atomically move baseline snapshots
+                if self.snapshots_enabled:
+                    for rel_path in applied_paths:
+                        clean_rel = self._normalize_rel_path(rel_path)
+                        src_snap = stage_snapshots / clean_rel
+                        if src_snap.exists():
+                            dst_snap = self.snapshot_store.get_snapshot_path(clean_rel)
+                            dst_snap.parent.mkdir(parents=True, exist_ok=True)
+                            if dst_snap.exists():
+                                backup_snap = stage_backup / "snap" / clean_rel
+                                backup_snap.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(dst_snap, backup_snap)
+                                moved_records.append((dst_snap, backup_snap, True))
+                            else:
+                                moved_records.append((dst_snap, None, False))
+                            src_snap.replace(dst_snap)
+
+                # 3. Handle deletions
+                for rel_path in deleted_paths:
+                    clean_rel = self._normalize_rel_path(rel_path)
+                    dst_file = self.root_dir / clean_rel
+                    if dst_file.exists():
+                        backup_file = stage_backup / "del_ws" / clean_rel
+                        backup_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(dst_file, backup_file)
+                        moved_records.append((dst_file, backup_file, True))
+                        dst_file.unlink()
+
+                    dst_snap = self.snapshot_store.get_snapshot_path(clean_rel)
+                    if dst_snap.exists():
+                        backup_snap = stage_backup / "del_snap" / clean_rel
+                        backup_snap.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(dst_snap, backup_snap)
+                        moved_records.append((dst_snap, backup_snap, True))
+                        dst_snap.unlink()
+
+                # 4. Atomic state update
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                if self.state_path.exists():
+                    backup_state = stage_backup / "ageroot.state.yaml"
+                    shutil.copy2(self.state_path, backup_state)
+                    moved_records.append((self.state_path, backup_state, True))
+                else:
+                    moved_records.append((self.state_path, None, False))
+                staged_state_file.replace(self.state_path)
+
+                # Update in-memory state
+                self.state = new_state
+
+            except Exception as move_err:
+                # Rollback on move failure
+                for target, backup, existed in reversed(moved_records):
+                    try:
+                        if existed and backup and backup.exists():
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(backup, target)
+                        elif not existed and target.exists():
+                            target.unlink()
+                    except Exception:
+                        pass
+                raise move_err
+
+            # Cleanup staging directory after successful apply
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+            return ApplyOutcome(
+                success=True,
+                applied_paths=applied_paths,
+                deleted_paths=deleted_paths,
+                skipped_paths=skipped_paths,
+            )
+
+        except Exception as e:
+            # Staging or commit error: clean up and rollback
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return ApplyOutcome(
+                success=False,
+                error=f"Apply failed: {e}",
+                staging_dir=staging_dir,
+            )
+
+    def format_summary(self, report: DryRunReport) -> str:
+        """Formats tiered summary-first confirmation report."""
+        return SummaryReport.format_summary(report)

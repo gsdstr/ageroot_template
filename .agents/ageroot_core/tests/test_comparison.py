@@ -1,20 +1,27 @@
-"""Comprehensive tests for safety-first comparison strategy in Ageroot."""
+"""Comprehensive tests for safety-first comparison strategy and AgerootUpdateEngine."""
 
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
-from ageroot_core.comparison import (
+from ageroot_core import (
+    AgerootUpdateEngine,
+    ApplyOptions,
+    ApplyOutcome,
     ComparisonResult,
     DeterministicNormalizer,
+    DryRunOptions,
+    DryRunReport,
     ManagedRegionParser,
     ResultClass,
     SnapshotStore,
     Strategy,
     SummaryReport,
-    ThreeWayComparisonEngine,
+    format_summary,
 )
+from ageroot_core.comparison import SimpleYamlHelper
 
 
 class TestDeterministicNormalizer(unittest.TestCase):
@@ -77,7 +84,6 @@ class TestManagedRegionParser(unittest.TestCase):
         ok, segs, err = ManagedRegionParser.parse_structure(text)
         self.assertTrue(ok)
         self.assertIsNone(err)
-        # Expected segments: 1. unmanaged "# Title", 2. caveman region, 3. custom-user region
         self.assertTrue(any(s["type"] == "region" and s["name"] == "caveman" for s in segs))
         self.assertTrue(any(s["type"] == "region" and s["name"] == "custom-user" for s in segs))
 
@@ -118,20 +124,6 @@ class TestManagedRegionParser(unittest.TestCase):
         self.assertNotIn("default template note", merged)
         self.assertTrue(any("user-notes" in w for w in warnings))
 
-    def test_template_adapter_has_only_generated_region(self):
-        template_agents = Path(__file__).resolve().parents[3] / "AGENTS.md"
-        ok, segments, error = ManagedRegionParser.parse_structure(
-            template_agents.read_text(encoding="utf-8")
-        )
-        self.assertTrue(ok, error)
-        regions = {
-            (segment["name"], segment["kind"])
-            for segment in segments
-            if segment["type"] == "region"
-        }
-        self.assertIn(("adapter", "generated"), regions)
-        self.assertEqual({("adapter", "generated")}, regions)
-
     def test_concurrent_edit_in_generated_region_is_conflict(self):
         base = "<!-- header-begin -->\nv1.0\n<!-- header-end -->\n"
         current = "<!-- header-begin -->\nv1.0-custom-edit\n<!-- header-end -->\n"
@@ -141,158 +133,485 @@ class TestManagedRegionParser(unittest.TestCase):
         self.assertIn("Concurrent edit", err)
 
 
-class TestThreeWayComparisonEngine(unittest.TestCase):
+class TestSimpleYamlHelper(unittest.TestCase):
+    def test_yaml_parse_and_dump_roundtrip(self):
+        yaml_content = (
+            "schema: 1\n"
+            "snapshots: enabled\n"
+            "project:\n"
+            "  name: my-project\n"
+            "template:\n"
+            "  name: ageroot\n"
+            "  version: 0.1.0\n"
+            "installed_at: '2026-09-03T00:00:00Z'\n"
+            "managed_files:\n"
+            "- path: AGENTS.md\n"
+            "  strategy: generated\n"
+            "  snapshot: .agents/snapshots/AGENTS.md\n"
+            "  sha256: '7f6bedc46bceeaff0fded6d2ff233ee305853987585865a8f5d34cc3f702a947'\n"
+            "- path: .agents/skills/\n"
+            "  strategy: external-link\n"
+        )
+        parsed = SimpleYamlHelper.parse(yaml_content)
+        self.assertEqual(parsed["schema"], 1)
+        self.assertEqual(parsed["snapshots"], "enabled")
+        self.assertEqual(parsed["project"]["name"], "my-project")
+        self.assertEqual(len(parsed["managed_files"]), 2)
+        self.assertEqual(parsed["managed_files"][0]["path"], "AGENTS.md")
+
+        dumped = SimpleYamlHelper.dump(parsed)
+        reparsed = SimpleYamlHelper.parse(dumped)
+        self.assertEqual(parsed, reparsed)
+
+
+class TestAgerootUpdateEngine(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.store = SnapshotStore(self.root)
-        self.engine = ThreeWayComparisonEngine(self.root, snapshots_enabled=True, snapshot_store=self.store)
+        self.agents_dir = self.root / ".agents"
+        self.agents_dir.mkdir(parents=True, exist_ok=True)
+        self.config_path = self.agents_dir / "ageroot.config.yaml"
+        self.state_path = self.agents_dir / "ageroot.state.yaml"
+
+        # Default config
+        self.config_path.write_text("schema: 1\nsnapshots: enabled\n", encoding="utf-8")
+
+        # Default empty state
+        initial_state = {
+            "schema": 1,
+            "template": {"name": "ageroot", "version": "0.1.0", "source": "local", "commit": "abc1234"},
+            "installed_at": "2026-09-03T00:00:00Z",
+            "rendered_at": "2026-09-03T00:00:00Z",
+            "managed_files": [],
+        }
+        self.state_path.write_text(SimpleYamlHelper.dump(initial_state), encoding="utf-8")
+
+        self.engine = AgerootUpdateEngine(
+            root_dir=self.root,
+            config_path=self.config_path,
+            state_path=self.state_path,
+        )
 
     def tearDown(self):
         self.tmp_dir.cleanup()
 
-    def test_planning_path_is_excluded_from_comparison_and_reporting(self):
-        result = self.engine.compare_path(".planning/test/task_plan.md", Strategy.GENERATED, "changed\n")
-        self.assertTrue(result.excluded)
-        self.assertEqual(result.result_class, ResultClass.UNCHANGED)
-        self.assertNotIn(".planning/test/task_plan.md", SummaryReport.format_summary([result]))
-
-    def test_clean_generated_update(self):
+    def test_clean_generated_dry_run_and_apply(self):
         rel_path = ".agents/AGENTS.md"
-        base_text = "# Title\n"
-        new_text = "# Title\n\nUpdated.\n"
+        base_text = "# Title\nInitial baseline\n"
+        new_text = "# Title\nUpdated template\n"
 
-        sha = self.store.write_snapshot_atomic(rel_path, base_text)
-        (self.root / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (self.root / rel_path).write_text(base_text)
+        # Setup baseline
+        target = self.root / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(base_text, encoding="utf-8")
+        sha = self.engine.snapshot_store.write_snapshot_atomic(rel_path, base_text)
 
-        res = self.engine.compare_path(
-            rel_path,
-            Strategy.GENERATED,
-            new_text,
-            state_entry={"sha256": sha},
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_path, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_path}", "sha256": sha}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
+
+        # 1. Dry run
+        report = self.engine.dry_run({rel_path: new_text})
+        self.assertTrue(report.is_eligible)
+        self.assertEqual(report[rel_path].result_class, ResultClass.CHANGED)
+        self.assertEqual(report[rel_path].strategy, Strategy.GENERATED)
+
+        # 2. Apply
+        outcome = self.engine.apply(report)
+        self.assertTrue(outcome.success)
+        self.assertIn(rel_path, outcome.applied_paths)
+
+        # Verify workspace file updated
+        self.assertEqual(target.read_text(encoding="utf-8"), DeterministicNormalizer.normalize_text(new_text))
+
+        # Verify snapshot updated
+        new_snap, snap_err = self.engine.snapshot_store.read_snapshot(rel_path)
+        self.assertIsNone(snap_err)
+        self.assertEqual(new_snap, DeterministicNormalizer.normalize_text(new_text))
+
+        # Verify state updated with new sha
+        updated_state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        entry = next(e for e in updated_state["managed_files"] if e["path"] == rel_path)
+        expected_sha = SnapshotStore.compute_sha256(DeterministicNormalizer.normalize_text(new_text))
+        self.assertEqual(entry["sha256"], expected_sha)
+
+        # Subsequent dry-run is UNCHANGED
+        report_subsequent = self.engine.dry_run({rel_path: new_text})
+        self.assertEqual(report_subsequent[rel_path].result_class, ResultClass.UNCHANGED)
+        self.assertTrue(report_subsequent.is_eligible)
+
+    def test_planning_path_excluded_from_dry_run_and_reporting(self):
+        plan_path = ".planning/feature/task_plan.md"
+        renders = {
+            plan_path: "# Task Plan\nShould be excluded\n",
+            ".agents/AGENTS.md": "# Clean Agents\n",
+        }
+        report = self.engine.dry_run(renders)
+        self.assertTrue(report.is_eligible)
+        self.assertTrue(report[plan_path].excluded)
+        self.assertEqual(report[plan_path].result_class, ResultClass.UNCHANGED)
+
+        summary = format_summary(report)
+        self.assertNotIn(".planning", summary)
+
+        outcome = self.engine.apply(report)
+        self.assertTrue(outcome.success)
+        self.assertNotIn(plan_path, outcome.applied_paths)
+        self.assertFalse((self.root / plan_path).exists())
+
+    def test_strategy_autodetection_for_new_paths(self):
+        # Path with region markers -> MANAGED_REGIONS
+        region_content = (
+            "# Agent Config\n\n"
+            "<!-- region:caveman kind:generated -->\n"
+            "caveman content\n"
+            "<!-- endregion:caveman -->\n"
         )
-        self.assertEqual(res.result_class, ResultClass.CHANGED)
-        self.assertTrue(res.is_eligible)
+        plain_content = "# Plain Doc\nNo markers here\n"
 
-    def test_generated_file_conflict_when_locally_modified(self):
+        renders = {
+            ".agents/AGENTS.md": region_content,
+            ".agents/README.md": plain_content,
+        }
+        report = self.engine.dry_run(renders)
+        self.assertEqual(report[".agents/AGENTS.md"].strategy, Strategy.MANAGED_REGIONS)
+        self.assertEqual(report[".agents/README.md"].strategy, Strategy.GENERATED)
+
+    def test_managed_regions_merge_and_conflict(self):
         rel_path = ".agents/AGENTS.md"
-        base_text = "# Title\n"
-        curr_text = "# Title\nLocal change\n"
-        new_text = "# Title\nUpstream change\n"
-
-        sha = self.store.write_snapshot_atomic(rel_path, base_text)
-        (self.root / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (self.root / rel_path).write_text(curr_text)
-
-        res = self.engine.compare_path(
-            rel_path,
-            Strategy.GENERATED,
-            new_text,
-            state_entry={"sha256": sha},
+        base_text = (
+            "<!-- header-begin -->\nv1.0\n<!-- header-end -->\n"
+            "<!-- user-notes-begin -->\nbase note\n<!-- user-notes-end -->\n"
         )
-        self.assertEqual(res.result_class, ResultClass.CONFLICT)
-        self.assertFalse(res.is_eligible)
+        curr_text = (
+            "<!-- header-begin -->\nv1.0\n<!-- header-end -->\n"
+            "<!-- user-notes-begin -->\ncustom user note\n<!-- user-notes-end -->\n"
+        )
+        new_render = (
+            "<!-- header-begin -->\nv2.0\n<!-- header-end -->\n"
+            "<!-- user-notes-begin -->\ndefault template note\n<!-- user-notes-end -->\n"
+        )
 
-    def test_snapshots_disabled_returns_unverified(self):
-        engine_no_snap = ThreeWayComparisonEngine(self.root, snapshots_enabled=False)
+        target = self.root / rel_path
+        target.write_text(curr_text, encoding="utf-8")
+        sha = self.engine.snapshot_store.write_snapshot_atomic(rel_path, base_text)
+
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_path, "strategy": "managed-regions", "snapshot": f".agents/snapshots/{rel_path}", "sha256": sha}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
+
+        # 1. Clean merge preserving user region
+        report = self.engine.dry_run({rel_path: new_render})
+        self.assertEqual(report[rel_path].result_class, ResultClass.REGION_MERGE)
+        self.assertTrue(report.is_eligible)
+        self.assertIn("custom user note", report[rel_path].proposed_content)
+        self.assertIn("v2.0", report[rel_path].proposed_content)
+
+        outcome = self.engine.apply(report)
+        self.assertTrue(outcome.success)
+        self.assertIn("custom user note", target.read_text(encoding="utf-8"))
+        self.assertIn("v2.0", target.read_text(encoding="utf-8"))
+
+        # 2. Concurrent edit in generated region causes CONFLICT
+        conflict_curr = (
+            "<!-- header-begin -->\nv2.0-local-hack\n<!-- header-end -->\n"
+            "<!-- user-notes-begin -->\ncustom user note\n<!-- user-notes-end -->\n"
+        )
+        target.write_text(conflict_curr, encoding="utf-8")
+        v3_render = (
+            "<!-- header-begin -->\nv3.0\n<!-- header-end -->\n"
+            "<!-- user-notes-begin -->\ndefault\n<!-- user-notes-end -->\n"
+        )
+        report_conflict = self.engine.dry_run({rel_path: v3_render})
+        self.assertEqual(report_conflict[rel_path].result_class, ResultClass.CONFLICT)
+        self.assertFalse(report_conflict.is_eligible)
+
+        outcome_conflict = self.engine.apply(report_conflict)
+        self.assertFalse(outcome_conflict.success)
+        self.assertIn("ineligible", outcome_conflict.error)
+
+    def test_workspace_drift_detection_modified(self):
+        rel_path = ".agents/AGENTS.md"
+        base_text = "# Clean\n"
+        target = self.root / rel_path
+        target.write_text(base_text, encoding="utf-8")
+        sha = self.engine.snapshot_store.write_snapshot_atomic(rel_path, base_text)
+
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_path, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_path}", "sha256": sha}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
+
+        report = self.engine.dry_run({rel_path: "# Clean\nUpdated\n"})
+        self.assertTrue(report.is_eligible)
+
+        # Simulate concurrent drift in workspace before apply
+        target.write_text("# Concurrent Out-of-Band Modification\n", encoding="utf-8")
+
+        outcome = self.engine.apply(report)
+        self.assertFalse(outcome.success)
+        self.assertIn("Workspace drift detected", outcome.error)
+        self.assertIn("file modified after dry-run", outcome.error)
+        # Verify file on disk was NOT overwritten
+        self.assertEqual(target.read_text(encoding="utf-8"), "# Concurrent Out-of-Band Modification\n")
+
+    def test_workspace_drift_detection_created(self):
+        rel_path = ".agents/NEW.md"
+        # File did not exist at dry-run
+        report = self.engine.dry_run({rel_path: "# Brand new\n"})
+        self.assertTrue(report.is_eligible)
+
+        # Simulate concurrent creation before apply
+        target = self.root / rel_path
+        target.write_text("# Conflicting creation\n", encoding="utf-8")
+
+        outcome = self.engine.apply(report)
+        self.assertFalse(outcome.success)
+        self.assertIn("Workspace drift detected", outcome.error)
+        self.assertIn("file was created after dry-run", outcome.error)
+
+    def test_workspace_drift_detection_deleted(self):
+        rel_path = ".agents/AGENTS.md"
+        target = self.root / rel_path
+        target.write_text("# Base\n", encoding="utf-8")
+        sha = self.engine.snapshot_store.write_snapshot_atomic(rel_path, "# Base\n")
+
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_path, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_path}", "sha256": sha}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
+
+        report = self.engine.dry_run({rel_path: "# Base\nUpdate\n"})
+        self.assertTrue(report.is_eligible)
+
+        # Simulate out-of-band deletion before apply
+        target.unlink()
+
+        outcome = self.engine.apply(report)
+        self.assertFalse(outcome.success)
+        self.assertIn("Workspace drift detected", outcome.error)
+        self.assertIn("file was deleted after dry-run", outcome.error)
+
+    def test_snapshots_disabled_policy(self):
+        # Set snapshots: disabled in config
+        self.config_path.write_text("schema: 1\nsnapshots: disabled\n", encoding="utf-8")
+        engine = AgerootUpdateEngine(self.root, self.config_path, self.state_path)
+
         rel_path = ".agents/PREFERENCES.md"
-        curr_text = "pref 1\n"
-        new_text = "pref 2\n"
+        target = self.root / rel_path
+        target.write_text("pref 1\n", encoding="utf-8")
 
-        (self.root / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (self.root / rel_path).write_text(curr_text)
+        report = engine.dry_run({rel_path: "pref 2\n"})
+        self.assertEqual(report[rel_path].result_class, ResultClass.UNVERIFIED)
+        self.assertTrue(report.is_eligible)
 
-        res = engine_no_snap.compare_path(
-            rel_path,
-            Strategy.GENERATED,
-            new_text,
-            state_entry=None,
-        )
-        self.assertEqual(res.result_class, ResultClass.UNVERIFIED)
-        self.assertTrue(res.is_eligible)
+        outcome = engine.apply(report)
+        self.assertTrue(outcome.success)
+        self.assertEqual(target.read_text(encoding="utf-8"), "pref 2\n")
 
-    def test_snapshot_corruption_blocks_and_escalates(self):
+        # Snapshot file must NOT have been written
+        snap_file = engine.snapshot_store.get_snapshot_path(rel_path)
+        self.assertFalse(snap_file.exists())
+
+    def test_snapshot_corruption_and_one_time_override(self):
         rel_path = ".agents/AGENTS.md"
         base_text = "# Baseline\n"
-        (self.root / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (self.root / rel_path).write_text(base_text)
+        target = self.root / rel_path
+        target.write_text(base_text, encoding="utf-8")
 
-        # Snapshot file has modified content vs expected state sha
-        self.store.write_snapshot_atomic(rel_path, "corrupted content")
+        # Write corrupted snapshot content
+        self.engine.snapshot_store.write_snapshot_atomic(rel_path, "corrupted content")
         expected_sha = SnapshotStore.compute_sha256(base_text)
 
-        res = self.engine.compare_path(
-            rel_path,
-            Strategy.GENERATED,
-            "# New Render\n",
-            state_entry={"sha256": expected_sha},
-        )
-        self.assertEqual(res.result_class, ResultClass.BLOCKED)
-        self.assertIn("corrupt", res.reason)
-        self.assertFalse(res.is_eligible)
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_path, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_path}", "sha256": expected_sha}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
 
-        # One-time unverified override allows progress as UNVERIFIED
-        res_override = self.engine.compare_path(
-            rel_path,
-            Strategy.GENERATED,
-            "# New Render\n",
-            state_entry={"sha256": expected_sha},
-            one_time_unverified_override=True,
-        )
-        self.assertEqual(res_override.result_class, ResultClass.UNVERIFIED)
-        self.assertTrue(res_override.is_eligible)
+        # 1. Normal dry run -> BLOCKED
+        report = self.engine.dry_run({rel_path: "# New Render\n"})
+        self.assertEqual(report[rel_path].result_class, ResultClass.BLOCKED)
+        self.assertFalse(report.is_eligible)
 
-    def test_external_link_validation(self):
+        outcome = self.engine.apply(report)
+        self.assertFalse(outcome.success)
+        self.assertIn("ineligible status 'blocked'", outcome.error)
+
+        # 2. One-time unverified override -> UNVERIFIED, eligible
+        report_override = self.engine.dry_run(
+            {rel_path: "# New Render\n"},
+            options=DryRunOptions(one_time_unverified_override=True),
+        )
+        self.assertEqual(report_override[rel_path].result_class, ResultClass.UNVERIFIED)
+        self.assertTrue(report_override.is_eligible)
+
+        outcome_override = self.engine.apply(report_override)
+        self.assertTrue(outcome_override.success)
+
+    def test_external_link_validation_and_persistence(self):
         rel_link = ".agents/skills/planning"
-        target = self.root / ".skills-manager" / "planning"
-        target.mkdir(parents=True, exist_ok=True)
+        target_dir = self.root / ".skills-manager" / "planning"
+        target_dir.mkdir(parents=True, exist_ok=True)
 
         link_path = self.root / rel_link
         link_path.parent.mkdir(parents=True, exist_ok=True)
-        link_path.symlink_to(target)
+        link_path.symlink_to(target_dir)
 
-        res = self.engine.compare_path(
-            rel_link,
-            Strategy.EXTERNAL_LINK,
-            expected_link_target=str(target),
-        )
-        self.assertEqual(res.result_class, ResultClass.UNCHANGED)
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_link, "strategy": "external-link", "target": str(target_dir)}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
 
-    def test_deletion_gating(self):
+        # Dry-run without including link in renders: must validate link and not treat as deletion
+        report = self.engine.dry_run({})
+        self.assertTrue(report.is_eligible)
+        self.assertEqual(report[rel_link].result_class, ResultClass.UNCHANGED)
+        self.assertEqual(report[rel_link].strategy, Strategy.EXTERNAL_LINK)
+
+        # If link is broken:
+        link_path.unlink()
+        broken_target = self.root / ".nonexistent"
+        link_path.symlink_to(broken_target)
+
+        report_broken = self.engine.dry_run({})
+        self.assertEqual(report_broken[rel_link].result_class, ResultClass.INVALID_LINK)
+        self.assertFalse(report_broken.is_eligible)
+
+        outcome = self.engine.apply(report_broken)
+        self.assertFalse(outcome.success)
+        self.assertIn("invalid-link", outcome.error)
+
+    def test_deletion_escalation_clean_and_modified(self):
         rel_path = ".agents/old_file.md"
-        base_text = "original\n"
-        sha = self.store.write_snapshot_atomic(rel_path, base_text)
+        base_text = "original content\n"
+        target = self.root / rel_path
+        target.write_text(base_text, encoding="utf-8")
+        sha = self.engine.snapshot_store.write_snapshot_atomic(rel_path, base_text)
 
-        file_path = self.root / rel_path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_path, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_path}", "sha256": sha}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
 
-        # 1. Clean deletion -> DELETION_PENDING
-        file_path.write_text(base_text)
-        res = self.engine.compare_path(
-            rel_path,
-            Strategy.GENERATED,
-            None,  # absent from new render
-            state_entry={"sha256": sha},
-        )
-        self.assertEqual(res.result_class, ResultClass.DELETION_PENDING)
-        self.assertFalse(res.is_eligible)
+        # 1. Clean deletion absent from renders -> DELETION_PENDING
+        report = self.engine.dry_run({})
+        self.assertEqual(report[rel_path].result_class, ResultClass.DELETION_PENDING)
+        self.assertFalse(report.is_eligible)  # Blocks ordinary apply
 
-        # 2. Locally modified deletion -> BLOCKED
-        file_path.write_text("locally modified\n")
-        res_modified = self.engine.compare_path(
-            rel_path,
-            Strategy.GENERATED,
-            None,
-            state_entry={"sha256": sha},
-        )
-        self.assertEqual(res_modified.result_class, ResultClass.BLOCKED)
-        self.assertIn("Locally modified", res_modified.reason)
-        self.assertFalse(res_modified.is_eligible)
+        # Ordinary apply fails
+        outcome = self.engine.apply(report)
+        self.assertFalse(outcome.success)
+        self.assertIn("deletion pending", outcome.error)
 
+        # Apply with explicit deletion confirmation succeeds
+        report_allow = self.engine.dry_run({}, options=DryRunOptions(allow_deletions=True))
+        self.assertTrue(report_allow.is_eligible)
+        outcome_allow = self.engine.apply(report_allow, options=ApplyOptions(allow_deletions=True))
+        self.assertTrue(outcome_allow.success)
+        self.assertIn(rel_path, outcome_allow.deleted_paths)
+        self.assertFalse(target.exists())
 
-class TestSummaryReport(unittest.TestCase):
-    def test_summary_formatting(self):
+        # 2. Locally modified file absent from renders -> BLOCKED
+        target.write_text("locally modified content\n", encoding="utf-8")
+        sha_orig = self.engine.snapshot_store.write_snapshot_atomic(rel_path, base_text)
+        state["managed_files"] = [
+            {"path": rel_path, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_path}", "sha256": sha_orig}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
+
+        report_modified = self.engine.dry_run({}, options=DryRunOptions(allow_deletions=True))
+        self.assertEqual(report_modified[rel_path].result_class, ResultClass.BLOCKED)
+        self.assertFalse(report_modified.is_eligible)
+        self.assertIn("Locally modified", report_modified[rel_path].reason)
+
+        outcome_mod = self.engine.apply(report_modified, options=ApplyOptions(allow_deletions=True))
+        self.assertFalse(outcome_mod.success)
+        self.assertIn("ineligible status 'blocked'", outcome_mod.error)
+        self.assertTrue(target.exists())
+
+    def test_staging_cleanup_and_transactional_rollback(self):
+        rel_path = ".agents/AGENTS.md"
+        base_text = "# Baseline\n"
+        target = self.root / rel_path
+        target.write_text(base_text, encoding="utf-8")
+        sha = self.engine.snapshot_store.write_snapshot_atomic(rel_path, base_text)
+
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_path, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_path}", "sha256": sha}
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
+
+        report = self.engine.dry_run({rel_path: "# Updated\n"})
+        outcome = self.engine.apply(report)
+        self.assertTrue(outcome.success)
+
+        # Verify no .staging-* folders remain in .agents
+        staging_dirs = [d for d in self.agents_dir.iterdir() if d.is_dir() and d.name.startswith(".staging-")]
+        self.assertEqual(len(staging_dirs), 0)
+
+    def test_transactional_rollback_on_apply_failure(self):
+        rel_1 = ".agents/AGENTS.md"
+        rel_2 = ".agents/SETUP.md"
+        content_1_orig = "# Agents v1\n"
+        content_2_orig = "# Setup v1\n"
+
+        target_1 = self.root / rel_1
+        target_2 = self.root / rel_2
+        target_1.write_text(content_1_orig, encoding="utf-8")
+        target_2.write_text(content_2_orig, encoding="utf-8")
+
+        sha_1 = self.engine.snapshot_store.write_snapshot_atomic(rel_1, content_1_orig)
+        sha_2 = self.engine.snapshot_store.write_snapshot_atomic(rel_2, content_2_orig)
+
+        state = SimpleYamlHelper.parse(self.state_path.read_text(encoding="utf-8"))
+        state["managed_files"] = [
+            {"path": rel_1, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_1}", "sha256": sha_1},
+            {"path": rel_2, "strategy": "generated", "snapshot": f".agents/snapshots/{rel_2}", "sha256": sha_2},
+        ]
+        self.state_path.write_text(SimpleYamlHelper.dump(state), encoding="utf-8")
+
+        renders = {
+            rel_1: "# Agents v2 Updated\n",
+            rel_2: "# Setup v2 Updated\n",
+        }
+        report = self.engine.dry_run(renders)
+        self.assertTrue(report.is_eligible)
+
+        # Inject a failure during file replace for the second file
+        original_replace = Path.replace
+        def mock_replace(p_self, target):
+            if "SETUP.md" in str(target) and ".staging-" not in str(target):
+                raise OSError("Simulated disk error during atomic move")
+            return original_replace(p_self, target)
+
+        Path.replace = mock_replace
+        try:
+            outcome = self.engine.apply(report)
+        finally:
+            Path.replace = original_replace
+
+        self.assertFalse(outcome.success)
+        self.assertIn("Simulated disk error", outcome.error)
+
+        # AGENTS.md must have been rolled back to content_1_orig!
+        self.assertEqual(target_1.read_text(encoding="utf-8"), content_1_orig)
+        self.assertEqual(target_2.read_text(encoding="utf-8"), content_2_orig)
+
+        # No staging directory should remain
+        staging_dirs = [d for d in self.agents_dir.iterdir() if d.is_dir() and d.name.startswith(".staging-")]
+        self.assertEqual(len(staging_dirs), 0)
+
+    def test_format_summary_tiered_reporting(self):
         results = [
             ComparisonResult(
                 path=".agents/AGENTS.md",
