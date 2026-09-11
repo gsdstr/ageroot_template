@@ -15,6 +15,7 @@ from ageroot_core import (
     DryRunOptions,
     DryRunReport,
     ManagedRegionParser,
+    RegionMergeResult,
     ResultClass,
     SnapshotStore,
     Strategy,
@@ -71,66 +72,223 @@ class TestSnapshotStore(unittest.TestCase):
 
 
 class TestManagedRegionParser(unittest.TestCase):
-    def test_valid_region_parsing(self):
-        text = (
-            "# Title\n\n"
-            "<!-- caveman-begin -->\n"
-            "caveman content\n"
-            "<!-- caveman-end -->\n\n"
-            "<!-- region:custom-user kind:user -->\n"
-            "my custom user rules\n"
-            "<!-- endregion:custom-user -->\n"
-        )
-        ok, segs, err = ManagedRegionParser.parse_structure(text)
-        self.assertTrue(ok)
-        self.assertIsNone(err)
-        self.assertTrue(any(s["type"] == "region" and s["name"] == "caveman" for s in segs))
-        self.assertTrue(any(s["type"] == "region" and s["name"] == "custom-user" for s in segs))
+    def test_has_region_markers(self):
+        # Type 1: VS Code #region in various comment styles
+        self.assertTrue(ManagedRegionParser.has_region_markers("<!-- #region foo -->"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("<!-- #region foo kind:generated -->"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("<!-- #endregion -->"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("<!-- #endregion foo -->"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("# #region py_block"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("# #endregion"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("// #region js_block"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("// #endregion"))
 
-    def test_malformed_region_unpaired(self):
-        text = "# Title\n<!-- caveman-begin -->\nno end marker"
-        ok, segs, err = ManagedRegionParser.parse_structure(text)
-        self.assertFalse(ok)
-        self.assertIn("Unclosed region", err)
+        # Type 1: Legacy aliases
+        self.assertTrue(ManagedRegionParser.has_region_markers("<!-- region:old-block kind:user -->"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("<!-- endregion:old-block -->"))
 
-    def test_malformed_region_nested(self):
-        text = (
-            "<!-- caveman-begin -->\n"
-            "<!-- rtk-begin -->\n"
-            "<!-- rtk-end -->\n"
-            "<!-- caveman-end -->\n"
-        )
-        ok, segs, err = ManagedRegionParser.parse_structure(text)
-        self.assertFalse(ok)
-        self.assertIn("Nested region", err)
+        # Type 3: Skill blocks
+        self.assertTrue(ManagedRegionParser.has_region_markers("<!-- caveman-begin -->"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("<!-- caveman-end -->"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("# rtk-begin"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("# rtk-end"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("// custom-begin"))
+        self.assertTrue(ManagedRegionParser.has_region_markers("// custom-end"))
 
-    def test_region_merge_preserves_user_and_updates_generated(self):
+        # Type 2: Metadata directives (must NOT match as region markers)
+        self.assertFalse(ManagedRegionParser.has_region_markers(
+            "<!-- generated-by: ageroot; template: 0.1.0; commit: abc; rendered-at: 2026-09-03T00:00:00Z -->"
+        ))
+        self.assertFalse(ManagedRegionParser.has_region_markers("# generated-by: ageroot"))
+        self.assertFalse(ManagedRegionParser.has_region_markers("// generated-by: ageroot"))
+
+        # Plain text and empty
+        self.assertFalse(ManagedRegionParser.has_region_markers("# Just a normal markdown heading"))
+        self.assertFalse(ManagedRegionParser.has_region_markers("def hello(): pass"))
+        self.assertFalse(ManagedRegionParser.has_region_markers(""))
+
+    def test_type1_clean_generated_update(self):
+        base = "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion header -->\n"
+        current = "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion header -->\n"
+        new_render = "<!-- #region header kind:generated -->\nv2.0\n<!-- #endregion header -->\n"
+        res = ManagedRegionParser.merge(current, new_render, base)
+        self.assertEqual(res.result_class, ResultClass.REGION_MERGE)
+        self.assertIn("v2.0", res.merged_text)
+        self.assertNotIn("v1.0", res.merged_text)
+        self.assertEqual(res.warnings, [])
+
+    def test_type1_user_preservation_and_warning(self):
         base = (
-            "<!-- header-begin -->\nv1.0\n<!-- header-end -->\n"
-            "<!-- user-notes-begin -->\nmy old note\n<!-- user-notes-end -->\n"
+            "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion -->\n"
+            "<!-- #region notes kind:user -->\nbase notes\n<!-- #endregion -->\n"
         )
         current = (
-            "<!-- header-begin -->\nv1.0\n<!-- header-end -->\n"
-            "<!-- user-notes-begin -->\nmy updated note\n<!-- user-notes-end -->\n"
+            "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion -->\n"
+            "<!-- #region notes kind:user -->\nmy custom user notes\n<!-- #endregion -->\n"
         )
         new_render = (
-            "<!-- header-begin -->\nv2.0\n<!-- header-end -->\n"
-            "<!-- user-notes-begin -->\ndefault template note\n<!-- user-notes-end -->\n"
+            "<!-- #region header kind:generated -->\nv2.0\n<!-- #endregion -->\n"
+            "<!-- #region notes kind:user -->\ndefault template notes\n<!-- #endregion -->\n"
         )
-        ok, merged, warnings, err = ManagedRegionParser.merge(current, new_render, base)
-        self.assertTrue(ok)
-        self.assertIn("v2.0", merged)
-        self.assertIn("my updated note", merged)
-        self.assertNotIn("default template note", merged)
-        self.assertTrue(any("user-notes" in w for w in warnings))
+        res = ManagedRegionParser.merge(current, new_render, base)
+        self.assertEqual(res.result_class, ResultClass.REGION_MERGE)
+        self.assertIn("v2.0", res.merged_text)
+        self.assertIn("my custom user notes", res.merged_text)
+        self.assertNotIn("default template notes", res.merged_text)
+        self.assertTrue(any("notes" in w and "local modifications" in w for w in res.warnings))
+
+    def test_type1_default_kind_is_user(self):
+        # Kind omitted -> defaults to user
+        base = (
+            "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion -->\n"
+            "<!-- #region custom -->\nbase custom\n<!-- #endregion -->\n"
+        )
+        current = (
+            "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion -->\n"
+            "<!-- #region custom -->\nmy custom edit\n<!-- #endregion -->\n"
+        )
+        new_render = (
+            "<!-- #region header kind:generated -->\nv2.0\n<!-- #endregion -->\n"
+            "<!-- #region custom -->\ntemplate default\n<!-- #endregion -->\n"
+        )
+        res = ManagedRegionParser.merge(current, new_render, base)
+        self.assertEqual(res.result_class, ResultClass.REGION_MERGE)
+        self.assertIn("my custom edit", res.merged_text)
+        self.assertNotIn("template default", res.merged_text)
+        self.assertIn("v2.0", res.merged_text)
+
+    def test_type1_anonymous_and_named_closing_tags(self):
+        # Anonymous closing tag pops LIFO
+        anon_text = "<!-- #region block1 -->\ncontent1\n<!-- #endregion -->\n"
+        res_anon = ManagedRegionParser.merge(anon_text, anon_text)
+        self.assertEqual(res_anon.result_class, ResultClass.UNCHANGED)
+
+        # Named closing tag matches
+        named_text = "<!-- #region block2 -->\ncontent2\n<!-- #endregion block2 -->\n"
+        res_named = ManagedRegionParser.merge(named_text, named_text)
+        self.assertEqual(res_named.result_class, ResultClass.UNCHANGED)
+
+    def test_type1_multi_comment_prefixes(self):
+        # Hash comment style (# #region)
+        py_base = "# #region config kind:generated\nv1 = True\n# #endregion config\n"
+        py_curr = "# #region config kind:generated\nv1 = True\n# #endregion config\n"
+        py_new = "# #region config kind:generated\nv2 = True\n# #endregion config\n"
+        res_py = ManagedRegionParser.merge(py_curr, py_new, py_base)
+        self.assertEqual(res_py.result_class, ResultClass.REGION_MERGE)
+        self.assertIn("v2 = True", res_py.merged_text)
+
+        # Slash comment style (// #region)
+        js_base = "// #region config kind:generated\nconst v = 1;\n// #endregion\n"
+        js_curr = "// #region config kind:generated\nconst v = 1;\n// #endregion\n"
+        js_new = "// #region config kind:generated\nconst v = 2;\n// #endregion\n"
+        res_js = ManagedRegionParser.merge(js_curr, js_new, js_base)
+        self.assertEqual(res_js.result_class, ResultClass.REGION_MERGE)
+        self.assertIn("const v = 2;", res_js.merged_text)
+
+    def test_type1_legacy_aliases(self):
+        base = "<!-- region:sec kind:generated -->\nold\n<!-- endregion:sec -->\n"
+        curr = "<!-- region:sec kind:generated -->\nold\n<!-- endregion:sec -->\n"
+        new_render = "<!-- region:sec kind:generated -->\nnew\n<!-- endregion:sec -->\n"
+        res = ManagedRegionParser.merge(curr, new_render, base)
+        self.assertEqual(res.result_class, ResultClass.REGION_MERGE)
+        self.assertIn("new", res.merged_text)
+
+    def test_type2_metadata_directive_normalization(self):
+        # Standalone generated-by is treated as unmanaged metadata and normalized
+        meta1 = "<!-- generated-by: ageroot; template: 0.1.0; commit: abc; rendered-at: 2026-09-03T00:00:00Z -->\n# Title\n"
+        meta2 = "<!-- generated-by: ageroot; template: 0.2.0; commit: def; rendered-at: 2026-09-04T00:00:00Z -->\n# Title\n"
+        self.assertEqual(
+            DeterministicNormalizer.normalize_text(meta1),
+            DeterministicNormalizer.normalize_text(meta2),
+        )
+        res = ManagedRegionParser.merge(meta1, meta2)
+        self.assertEqual(res.result_class, ResultClass.UNCHANGED)
+
+    def test_type3_skill_blocks_user_ownership(self):
+        # caveman, rtk, and custom skill blocks are always kind:user
+        base = (
+            "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion -->\n"
+            "<!-- caveman-begin -->\nterse mode\n<!-- caveman-end -->\n"
+            "<!-- rtk-begin -->\nrtk rules\n<!-- rtk-end -->\n"
+        )
+        curr = (
+            "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion -->\n"
+            "<!-- caveman-begin -->\nuser customized caveman\n<!-- caveman-end -->\n"
+            "<!-- rtk-begin -->\nuser customized rtk\n<!-- rtk-end -->\n"
+        )
+        new_render = (
+            "<!-- #region header kind:generated -->\nv2.0\n<!-- #endregion -->\n"
+            "<!-- caveman-begin -->\ndefault upstream caveman\n<!-- caveman-end -->\n"
+            "<!-- rtk-begin -->\ndefault upstream rtk\n<!-- rtk-end -->\n"
+        )
+        res = ManagedRegionParser.merge(curr, new_render, base)
+        self.assertEqual(res.result_class, ResultClass.REGION_MERGE)
+        self.assertIn("v2.0", res.merged_text)
+        self.assertIn("user customized caveman", res.merged_text)
+        self.assertIn("user customized rtk", res.merged_text)
+        self.assertNotIn("default upstream caveman", res.merged_text)
+        self.assertNotIn("default upstream rtk", res.merged_text)
+
+    def test_structural_error_unclosed_region(self):
+        text = "# Title\n<!-- #region unclosed -->\nno end marker\n"
+        res = ManagedRegionParser.merge(text, text)
+        self.assertEqual(res.result_class, ResultClass.BLOCKED)
+        self.assertIn("Unclosed region", res.reason)
+
+    def test_structural_error_unmatched_closing_tag(self):
+        named_text = "<!-- #endregion orphan -->\n"
+        res_named = ManagedRegionParser.merge(named_text, named_text)
+        self.assertEqual(res_named.result_class, ResultClass.BLOCKED)
+        self.assertIn("Unmatched closing marker", res_named.reason)
+
+        anon_text = "<!-- #endregion -->\n"
+        res_anon = ManagedRegionParser.merge(anon_text, anon_text)
+        self.assertEqual(res_anon.result_class, ResultClass.BLOCKED)
+        self.assertIn("Unmatched closing marker", res_anon.reason)
+
+    def test_structural_error_mismatched_closing_tag(self):
+        text = "<!-- #region blockA -->\ncontent\n<!-- #endregion blockB -->\n"
+        res = ManagedRegionParser.merge(text, text)
+        self.assertEqual(res.result_class, ResultClass.BLOCKED)
+        self.assertIn("Mismatched region end marker", res.reason)
+
+    def test_structural_error_nested_regions(self):
+        text = (
+            "<!-- #region outer -->\n"
+            "<!-- #region inner -->\n"
+            "<!-- #endregion inner -->\n"
+            "<!-- #endregion outer -->\n"
+        )
+        res = ManagedRegionParser.merge(text, text)
+        self.assertEqual(res.result_class, ResultClass.BLOCKED)
+        self.assertIn("Nested region", res.reason)
 
     def test_concurrent_edit_in_generated_region_is_conflict(self):
-        base = "<!-- header-begin -->\nv1.0\n<!-- header-end -->\n"
-        current = "<!-- header-begin -->\nv1.0-custom-edit\n<!-- header-end -->\n"
-        new_render = "<!-- header-begin -->\nv2.0\n<!-- header-end -->\n"
-        ok, merged, warnings, err = ManagedRegionParser.merge(current, new_render, base)
-        self.assertFalse(ok)
-        self.assertIn("Concurrent edit", err)
+        base = "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion -->\n"
+        current = "<!-- #region header kind:generated -->\nv1.0-custom-edit\n<!-- #endregion -->\n"
+        new_render = "<!-- #region header kind:generated -->\nv2.0\n<!-- #endregion -->\n"
+        res = ManagedRegionParser.merge(current, new_render, base)
+        self.assertEqual(res.result_class, ResultClass.CONFLICT)
+        self.assertIn("Concurrent edit", res.reason)
+
+    def test_empty_user_region_preserved(self):
+        base = "<!-- #region empty kind:user -->\n<!-- #endregion -->\n"
+        current = "<!-- #region empty kind:user -->\n<!-- #endregion -->\n"
+        new_render = "<!-- #region empty kind:user -->\ndefault template content\n<!-- #endregion -->\n"
+        res = ManagedRegionParser.merge(current, new_render, base)
+        self.assertEqual(res.result_class, ResultClass.UNCHANGED)
+        self.assertEqual(res.merged_text, current)
+
+    def test_newly_added_region_in_template(self):
+        current = "<!-- #region existing kind:user -->\nuser content\n<!-- #endregion -->\n"
+        new_render = (
+            "<!-- #region existing kind:user -->\ndefault content\n<!-- #endregion -->\n"
+            "<!-- #region new_feature kind:generated -->\nfeature 1.0\n<!-- #endregion -->\n"
+        )
+        res = ManagedRegionParser.merge(current, new_render)
+        self.assertEqual(res.result_class, ResultClass.REGION_MERGE)
+        self.assertIn("user content", res.merged_text)
+        self.assertIn("feature 1.0", res.merged_text)
 
 
 class TestSimpleYamlHelper(unittest.TestCase):
@@ -282,15 +440,15 @@ class TestAgerootUpdateEngine(unittest.TestCase):
     def test_managed_regions_merge_and_conflict(self):
         rel_path = ".agents/AGENTS.md"
         base_text = (
-            "<!-- header-begin -->\nv1.0\n<!-- header-end -->\n"
+            "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion header -->\n"
             "<!-- user-notes-begin -->\nbase note\n<!-- user-notes-end -->\n"
         )
         curr_text = (
-            "<!-- header-begin -->\nv1.0\n<!-- header-end -->\n"
+            "<!-- #region header kind:generated -->\nv1.0\n<!-- #endregion header -->\n"
             "<!-- user-notes-begin -->\ncustom user note\n<!-- user-notes-end -->\n"
         )
         new_render = (
-            "<!-- header-begin -->\nv2.0\n<!-- header-end -->\n"
+            "<!-- #region header kind:generated -->\nv2.0\n<!-- #endregion header -->\n"
             "<!-- user-notes-begin -->\ndefault template note\n<!-- user-notes-end -->\n"
         )
 
@@ -318,12 +476,12 @@ class TestAgerootUpdateEngine(unittest.TestCase):
 
         # 2. Concurrent edit in generated region causes CONFLICT
         conflict_curr = (
-            "<!-- header-begin -->\nv2.0-local-hack\n<!-- header-end -->\n"
+            "<!-- #region header kind:generated -->\nv2.0-local-hack\n<!-- #endregion header -->\n"
             "<!-- user-notes-begin -->\ncustom user note\n<!-- user-notes-end -->\n"
         )
         target.write_text(conflict_curr, encoding="utf-8")
         v3_render = (
-            "<!-- header-begin -->\nv3.0\n<!-- header-end -->\n"
+            "<!-- #region header kind:generated -->\nv3.0\n<!-- #endregion header -->\n"
             "<!-- user-notes-begin -->\ndefault\n<!-- user-notes-end -->\n"
         )
         report_conflict = self.engine.dry_run({rel_path: v3_render})

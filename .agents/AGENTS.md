@@ -24,6 +24,13 @@ Boundaries: code/commits/PRs written normal.
 use @rtk:`rules/rtk-rules.md`
 <!-- rtk-end -->
 
+<!-- frame-begin -->
+Response Integrity Frame:
+- Start every user-facing message with `▲` on its own line.
+- End every user-facing message with `▼` on its own line.
+- Use only when communicating with user.
+<!-- frame-end -->
+
 This folder is portable Ageroot instructions. Any harness (Claude Code, Cursor, Windsurf, OpenCode, OpenClaw, Copilot CLI, Gemini, Hermes, Pi, Codex, standalone Python, Antigravity) can mount it and use the same skills and protocols.
 
 - Always read and respect project preferences from `.agents/PREFERENCES.md`!

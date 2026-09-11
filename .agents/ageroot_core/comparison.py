@@ -364,8 +364,13 @@ class DeterministicNormalizer:
         # 4. Generated-file provenance is metadata, not managed content. A
         # version/commit/timestamp-only change must not create an update.
         normalized = re.sub(
-            r"<!-- generated-by: ageroot; template: [^;]+; commit: [^;]+; rendered-at: [^>]+ -->",
+            r"<!--\s*generated-by:\s*ageroot(?:;.*?)?\s*-->",
             "<!-- generated-by: ageroot -->",
+            normalized,
+        )
+        normalized = re.sub(
+            r"(?m)^\s*(#|//)\s*generated-by:\s*ageroot(?:;.*)?$",
+            r"\1 generated-by: ageroot",
             normalized,
         )
 
@@ -426,148 +431,250 @@ class SnapshotStore:
 
 
 @dataclass
-class Region:
+class RegionMergeResult:
+    result_class: ResultClass
+    merged_text: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+    reason: Optional[str] = None
+    diff: Optional[str] = None
+
+
+@dataclass
+class _RegionMarker:
+    marker_type: str  # "start" or "end"
+    name: Optional[str]
+    kind: str
+    raw_line: str
+
+
+@dataclass
+class _RegionSegment:
     name: str
-    kind: str  # 'generated' or 'user'
-    content: str  # content inside the markers
+    kind: str
+    start_marker: str
+    end_marker: str
+    content: str
+    raw: str
+
+
+@dataclass
+class _UnmanagedSegment:
+    raw: str
+
+
+_Segment = Union[_RegionSegment, _UnmanagedSegment]
 
 
 class ManagedRegionParser:
     """Parses and merges files containing declared region markers."""
 
     MARKER_PATTERN = re.compile(
-        r"<!--\s*(?:(?P<legacy_start>[\w-]+)-begin|(?P<legacy_end>[\w-]+)-end|region:(?P<named_start>[\w-]+)(?:\s+kind:(?P<kind>generated|user))?|endregion:(?P<named_end>[\w-]+))\s*-->"
+        r"(?:<!--|#|//)\s*(?:#?region\s+[\w-]+|region:[\w-]+|#?endregion|endregion:[\w-]+|[\w-]+-begin|[\w-]+-end)"
     )
 
+    _LINE_COMMENT_RE = re.compile(
+        r"^\s*(?:<!--\s*(?P<html_body>.*?)\s*-->|//\s*(?P<slash_body>.*?)|#\s*(?P<hash_body>.*?))\s*$"
+    )
+    _T1_START_RE = re.compile(
+        r"^(?:#?region\s+(?P<name>[\w-]+)|region:(?P<leg_name>[\w-]+))(?:\s+kind:(?P<kind>[\w-]+))?$"
+    )
+    _T1_END_RE = re.compile(
+        r"^(?:#?endregion(?:\s+(?P<name>[\w-]+))?|endregion:(?P<leg_name>[\w-]+))$"
+    )
+    _T3_START_RE = re.compile(r"^(?P<name>[\w-]+)-begin$")
+    _T3_END_RE = re.compile(r"^(?P<name>[\w-]+)-end$")
+    _T2_META_RE = re.compile(r"^generated-by:\s*ageroot(?:;.*)?$")
+
     @classmethod
-    def parse_structure(cls, text: str) -> Tuple[bool, Optional[List[dict]], Optional[str]]:
+    def _match_marker(cls, line: str) -> Optional[_RegionMarker]:
+        m = cls._LINE_COMMENT_RE.match(line)
+        if not m:
+            return None
+        body = (m.group("html_body") or m.group("slash_body") or m.group("hash_body") or "").strip()
+        if cls._T2_META_RE.match(body):
+            return None
+        m_t1_s = cls._T1_START_RE.match(body)
+        if m_t1_s:
+            name = m_t1_s.group("name") or m_t1_s.group("leg_name")
+            kind = m_t1_s.group("kind") or "user"
+            if kind not in ("user", "generated"):
+                kind = "user"
+            return _RegionMarker("start", name, kind, line)
+        m_t1_e = cls._T1_END_RE.match(body)
+        if m_t1_e:
+            name = m_t1_e.group("name") or m_t1_e.group("leg_name")
+            return _RegionMarker("end", name, "user", line)
+        m_t3_s = cls._T3_START_RE.match(body)
+        if m_t3_s:
+            return _RegionMarker("start", m_t3_s.group("name"), "user", line)
+        m_t3_e = cls._T3_END_RE.match(body)
+        if m_t3_e:
+            return _RegionMarker("end", m_t3_e.group("name"), "user", line)
+        return None
+
+    @classmethod
+    def has_region_markers(cls, text: str) -> bool:
+        """Returns True if text contains any Type 1 or Type 3 region boundaries."""
+        if not text:
+            return False
+        for line in text.splitlines():
+            if cls._match_marker(line) is not None:
+                return True
+        return False
+
+    @classmethod
+    def _parse_structure(cls, text: str) -> Tuple[bool, Optional[List[_Segment]], Optional[str]]:
         norm_text = DeterministicNormalizer.normalize_text(text)
         lines = norm_text.splitlines(keepends=True)
-        
-        segments = []
-        open_stack = []
-        current_segment_lines = []
 
-        line_idx = 0
-        while line_idx < len(lines):
-            line = lines[line_idx]
-            match = cls.MARKER_PATTERN.search(line)
-            if match:
-                m_dict = match.groupdict()
-                start_name = m_dict.get("legacy_start") or m_dict.get("named_start")
-                end_name = m_dict.get("legacy_end") or m_dict.get("named_end")
+        segments: List[_Segment] = []
+        open_stack: List[_RegionMarker] = []
+        current_unmanaged: List[str] = []
+        current_region_lines: List[str] = []
 
-                if start_name:
+        for line in lines:
+            marker = cls._match_marker(line)
+            if marker:
+                if marker.marker_type == "start":
                     if open_stack:
-                        return False, None, f"Nested region '{start_name}' inside '{open_stack[-1]['name']}' is not allowed"
-                    # Flush prior unmanaged segment if it has content
-                    if current_segment_lines:
-                        raw_str = "".join(current_segment_lines)
-                        if raw_str:
-                            segments.append({
-                                "type": "unmanaged",
-                                "name": None,
-                                "raw": raw_str,
-                            })
-                        current_segment_lines = []
-                    
-                    kind = m_dict.get("kind")
-                    if not kind:
-                        kind = "generated" if start_name in ("generated", "header", "caveman", "rtk") else "user"
-
-                    open_stack.append({
-                        "name": start_name,
-                        "kind": kind,
-                        "start_marker": line,
-                    })
-                    current_segment_lines.append(line)
-                elif end_name:
+                        return False, None, f"Nested region '{marker.name}' inside '{open_stack[-1].name}' is not allowed"
+                    if current_unmanaged:
+                        segments.append(_UnmanagedSegment("".join(current_unmanaged)))
+                        current_unmanaged = []
+                    open_stack.append(marker)
+                    current_region_lines = [line]
+                elif marker.marker_type == "end":
                     if not open_stack:
-                        return False, None, f"Unmatched closing marker for '{end_name}'"
+                        err = f"Unmatched closing marker for '{marker.name}'" if marker.name else "Unmatched closing marker"
+                        return False, None, err
                     top = open_stack.pop()
-                    if top["name"] != end_name:
-                        return False, None, f"Mismatched region end marker: expected '{top['name']}', got '{end_name}'"
-                    
-                    current_segment_lines.append(line)
-                    segments.append({
-                        "type": "region",
-                        "name": top["name"],
-                        "kind": top["kind"],
-                        "start_marker": top["start_marker"],
-                        "end_marker": line,
-                        "content": "".join(current_segment_lines[1:-1]),
-                        "raw": "".join(current_segment_lines),
-                    })
-                    current_segment_lines = []
+                    if marker.name is not None and top.name != marker.name:
+                        return False, None, f"Mismatched region end marker: expected '{top.name}', got '{marker.name}'"
+                    current_region_lines.append(line)
+                    content = "".join(current_region_lines[1:-1])
+                    raw = "".join(current_region_lines)
+                    segments.append(_RegionSegment(
+                        name=top.name,
+                        kind=top.kind,
+                        start_marker=top.raw_line,
+                        end_marker=line,
+                        content=content,
+                        raw=raw,
+                    ))
+                    current_region_lines = []
             else:
-                current_segment_lines.append(line)
-            line_idx += 1
+                if open_stack:
+                    current_region_lines.append(line)
+                else:
+                    current_unmanaged.append(line)
 
         if open_stack:
-            return False, None, f"Unclosed region marker for '{open_stack[-1]['name']}'"
+            return False, None, f"Unclosed region marker for '{open_stack[-1].name}'"
 
-        if current_segment_lines:
-            raw_str = "".join(current_segment_lines)
-            if raw_str:
-                segments.append({
-                    "type": "unmanaged",
-                    "name": None,
-                    "raw": raw_str,
-                })
+        if current_unmanaged:
+            segments.append(_UnmanagedSegment("".join(current_unmanaged)))
 
         return True, segments, None
 
     @classmethod
+    def parse_structure(cls, text: str) -> Tuple[bool, Optional[List[_Segment]], Optional[str]]:
+        """Backwards-compatible alias for _parse_structure."""
+        return cls._parse_structure(text)
+
+    @classmethod
     def merge(
-        cls, current_text: str, new_rendered_text: str, baseline_text: Optional[str]
-    ) -> Tuple[bool, Optional[str], List[str], Optional[str]]:
-        curr_ok, curr_segs, curr_err = cls.parse_structure(current_text)
+        cls,
+        current_text: str,
+        new_rendered_text: str,
+        baseline_text: Optional[str] = None,
+    ) -> RegionMergeResult:
+        """Executes a three-way region merge across declared boundaries.
+
+        Returns a strongly-typed RegionMergeResult containing the domain ResultClass.
+        """
+        curr_ok, curr_segs, curr_err = cls._parse_structure(current_text)
         if not curr_ok:
-            return False, None, [], f"Current file region structure malformed: {curr_err}"
+            return RegionMergeResult(
+                result_class=ResultClass.BLOCKED,
+                merged_text=None,
+                reason=f"Current file region structure malformed: {curr_err}",
+            )
 
-        new_ok, new_segs, new_err = cls.parse_structure(new_rendered_text)
+        new_ok, new_segs, new_err = cls._parse_structure(new_rendered_text)
         if not new_ok:
-            return False, None, [], f"New render region structure malformed: {new_err}"
+            return RegionMergeResult(
+                result_class=ResultClass.BLOCKED,
+                merged_text=None,
+                reason=f"New render region structure malformed: {new_err}",
+            )
 
-        base_segs_map = {}
+        base_regions_map = {}
         if baseline_text:
-            base_ok, base_segs, base_err = cls.parse_structure(baseline_text)
-            if base_ok:
-                for seg in base_segs:
-                    if seg.get("type") == "region":
-                        base_segs_map[seg["name"]] = seg
+            base_ok, base_segs, base_err = cls._parse_structure(baseline_text)
+            if not base_ok:
+                return RegionMergeResult(
+                    result_class=ResultClass.BLOCKED,
+                    merged_text=None,
+                    reason=f"Baseline file region structure malformed: {base_err}",
+                )
+            for seg in base_segs:
+                if isinstance(seg, _RegionSegment):
+                    base_regions_map[seg.name] = seg
 
-        curr_regions = {s["name"]: s for s in curr_segs if s.get("type") == "region"}
-        warnings = []
+        curr_regions_map = {seg.name: seg for seg in curr_segs if isinstance(seg, _RegionSegment)}
+        warnings: List[str] = []
+        merged_pieces: List[str] = []
 
-        merged_pieces = []
         for n_seg in new_segs:
-            if n_seg["type"] == "unmanaged":
-                merged_pieces.append(n_seg["raw"])
-            elif n_seg["type"] == "region":
-                r_name = n_seg["name"]
-                r_kind = n_seg["kind"]
-                
-                if r_name in curr_regions:
-                    c_seg = curr_regions[r_name]
-                    if r_kind == "user":
-                        # Preserve current user region content
-                        merged_pieces.append(c_seg["raw"])
-                        if base_segs_map.get(r_name) and DeterministicNormalizer.normalize_text(c_seg["content"]) != DeterministicNormalizer.normalize_text(base_segs_map[r_name]["content"]):
-                            warnings.append(f"User region '{r_name}' has local modifications (preserved)")
-                    else:  # generated
-                        # Check concurrent modification vs baseline
-                        if base_segs_map.get(r_name):
-                            b_content = DeterministicNormalizer.normalize_text(base_segs_map[r_name]["content"])
-                            c_content = DeterministicNormalizer.normalize_text(c_seg["content"])
-                            n_content = DeterministicNormalizer.normalize_text(n_seg["content"])
-                            if c_content != b_content and c_content != n_content:
-                                return False, None, [], f"Concurrent edit in generated region '{r_name}': local modifications conflict with template update"
-                        merged_pieces.append(n_seg["raw"])
-                else:
-                    merged_pieces.append(n_seg["raw"])
+            if isinstance(n_seg, _UnmanagedSegment):
+                merged_pieces.append(n_seg.raw)
+            elif isinstance(n_seg, _RegionSegment):
+                r_name = n_seg.name
+                r_kind = n_seg.kind
 
-        return True, "".join(merged_pieces), warnings, None
+                if r_name in curr_regions_map:
+                    c_seg = curr_regions_map[r_name]
+                    if r_kind == "user":
+                        # User region: preserve current workspace content
+                        merged_pieces.append(c_seg.raw)
+                        if r_name in base_regions_map:
+                            b_seg = base_regions_map[r_name]
+                            if DeterministicNormalizer.normalize_text(c_seg.content) != DeterministicNormalizer.normalize_text(b_seg.content):
+                                warnings.append(f"User region '{r_name}' has local modifications (preserved)")
+                    else:  # generated
+                        # Generated region: template update wins, check concurrent modification
+                        if r_name in base_regions_map:
+                            b_content = DeterministicNormalizer.normalize_text(base_regions_map[r_name].content)
+                            c_content = DeterministicNormalizer.normalize_text(c_seg.content)
+                            n_content = DeterministicNormalizer.normalize_text(n_seg.content)
+                            if c_content != b_content and c_content != n_content:
+                                return RegionMergeResult(
+                                    result_class=ResultClass.CONFLICT,
+                                    merged_text=None,
+                                    warnings=warnings,
+                                    reason=f"Concurrent edit in generated region '{r_name}': local modifications conflict with template update",
+                                )
+                        merged_pieces.append(n_seg.raw)
+                else:
+                    # Newly added region in template
+                    merged_pieces.append(n_seg.raw)
+
+        merged_text = "".join(merged_pieces)
+
+        if DeterministicNormalizer.normalize_text(merged_text) == DeterministicNormalizer.normalize_text(current_text):
+            return RegionMergeResult(
+                result_class=ResultClass.UNCHANGED,
+                merged_text=merged_text,
+                warnings=warnings,
+                reason="Proposed region merge resulted in identical content",
+            )
+
+        return RegionMergeResult(
+            result_class=ResultClass.REGION_MERGE,
+            merged_text=merged_text,
+            warnings=warnings,
+            reason="Proposed region merge: user regions preserved, generated regions updated",
+        )
 
 
 class ThreeWayComparisonEngine:
@@ -809,51 +916,53 @@ class ThreeWayComparisonEngine:
                     new_snapshot_sha256=new_sha,
                 )
 
-            merge_ok, merged_text, warnings, merge_err = ManagedRegionParser.merge(
+            merge_result = ManagedRegionParser.merge(
                 current_text=current_content,
                 new_rendered_text=new_render_content,
                 baseline_text=baseline_content,
             )
 
-            if not merge_ok:
-                if "Concurrent edit" in (merge_err or ""):
-                    return ComparisonResult(
-                        path=relative_path,
-                        strategy=strategy,
-                        result_class=ResultClass.CONFLICT,
-                        reason=merge_err,
-                    )
+            if merge_result.result_class == ResultClass.CONFLICT:
+                return ComparisonResult(
+                    path=relative_path,
+                    strategy=strategy,
+                    result_class=ResultClass.CONFLICT,
+                    reason=merge_result.reason,
+                    warnings=merge_result.warnings,
+                )
+            elif merge_result.result_class == ResultClass.BLOCKED:
                 return ComparisonResult(
                     path=relative_path,
                     strategy=strategy,
                     result_class=ResultClass.BLOCKED,
-                    reason=f"Malformed region structure: {merge_err}",
+                    reason=merge_result.reason,
+                    warnings=merge_result.warnings,
                 )
-
-            norm_merged = DeterministicNormalizer.normalize_text(merged_text)
-            if norm_merged == norm_current:
+            elif merge_result.result_class == ResultClass.UNCHANGED:
+                norm_merged = DeterministicNormalizer.normalize_text(merge_result.merged_text or current_content)
                 return ComparisonResult(
                     path=relative_path,
                     strategy=strategy,
                     result_class=ResultClass.UNCHANGED,
-                    reason="Proposed region merge resulted in identical content",
+                    reason=merge_result.reason or "Proposed region merge resulted in identical content",
                     proposed_content=norm_merged,
-                    warnings=warnings,
+                    warnings=merge_result.warnings,
                     new_snapshot_content=norm_new,
                     new_snapshot_sha256=new_sha,
                 )
-
-            return ComparisonResult(
-                path=relative_path,
-                strategy=strategy,
-                result_class=ResultClass.REGION_MERGE,
-                reason="Proposed region merge: user regions preserved, generated regions updated",
-                proposed_content=norm_merged,
-                warnings=warnings,
-                diff=f"--- current\n+++ proposed_region_merge\n@@ {relative_path} @@",
-                new_snapshot_content=norm_new,
-                new_snapshot_sha256=new_sha,
-            )
+            else:  # ResultClass.REGION_MERGE
+                norm_merged = DeterministicNormalizer.normalize_text(merge_result.merged_text or "")
+                return ComparisonResult(
+                    path=relative_path,
+                    strategy=strategy,
+                    result_class=ResultClass.REGION_MERGE,
+                    reason=merge_result.reason or "Proposed region merge: user regions preserved, generated regions updated",
+                    proposed_content=norm_merged,
+                    warnings=merge_result.warnings,
+                    diff=f"--- current\n+++ proposed_region_merge\n@@ {relative_path} @@",
+                    new_snapshot_content=norm_new,
+                    new_snapshot_sha256=new_sha,
+                )
 
         return ComparisonResult(
             path=relative_path,
@@ -1061,7 +1170,7 @@ class AgerootUpdateEngine:
                     strategy = Strategy.GENERATED
             else:
                 # New path: auto-detect region markers or default to generated
-                if ManagedRegionParser.MARKER_PATTERN.search(content):
+                if ManagedRegionParser.has_region_markers(content):
                     strategy = Strategy.MANAGED_REGIONS
                 else:
                     strategy = Strategy.GENERATED
