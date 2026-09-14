@@ -26,8 +26,8 @@ use @rtk:`rules/rtk-rules.md`
 
 <!-- frame-begin -->
 Response Integrity Frame:
-- Start every user-facing message with `▲` on its own line.
-- End every user-facing message with `▼` on its own line.
+- Start every user-facing message with `▼` on its own line.
+- End every user-facing message with `▲` on its own line.
 - Use only when communicating with user.
 <!-- frame-end -->
 
