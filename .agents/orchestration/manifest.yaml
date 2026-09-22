@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "templates": [
+    {"id": "intake", "path": "phases/01-intake.md", "schema": "schemas/phase-template.schema.json"},
+    {"id": "research-planning", "path": "phases/02-research-planning.md", "schema": "schemas/phase-template.schema.json"},
+    {"id": "implementation", "path": "phases/03-implementation.md", "schema": "schemas/phase-template.schema.json"},
+    {"id": "review-integration", "path": "phases/04-review-integration.md", "schema": "schemas/phase-template.schema.json"}
+  ],
+  "lifecycle_map": {"path": "lifecycle-map.md", "schema": "schemas/lifecycle-map.schema.json"},
+  "handoff_schema": "schemas/handoff.schema.json"
+}

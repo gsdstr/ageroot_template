@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Neutral orchestration lifecycle map",
+  "type": "object",
+  "required": ["phase_order", "owner_gates", "loopbacks"],
+  "properties": {
+    "phase_order": {"const": ["intake", "research-planning", "implementation", "review-integration"]},
+    "owner_gates": {"type": "array", "minItems": 3},
+    "loopbacks": {"type": "array"}
+  },
+  "additionalProperties": false
+}

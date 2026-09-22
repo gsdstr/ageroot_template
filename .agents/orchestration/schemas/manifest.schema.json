@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Neutral orchestration manifest",
+  "type": "object",
+  "required": ["version", "templates", "lifecycle_map", "handoff_schema"],
+  "properties": {
+    "version": {"const": "1.0.0"},
+    "templates": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "type": "object",
+        "required": ["id", "path", "schema"],
+        "properties": {
+          "id": {"enum": ["intake", "research-planning", "implementation", "review-integration"]},
+          "path": {"type": "string", "pattern": "^phases/.+\\.md$"},
+          "schema": {"const": "schemas/phase-template.schema.json"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "lifecycle_map": {"type": "object", "required": ["path", "schema"]},
+    "handoff_schema": {"const": "schemas/handoff.schema.json"}
+  },
+  "additionalProperties": false
+}

@@ -40,6 +40,16 @@ This folder is portable Ageroot instructions. Any harness (Claude Code, Cursor, 
 - `protocols/tool_schemas/` — typed interfaces for external tools
 - `protocols/delegation.md` — rules for sub-agent handoff
 
+## Orca orchestration adapter
+
+- Availability: enabled; default mode: `neutral`.
+- Package: `.agents/orchestration/orca/`; audit:
+  `.planning/<plan-id>/orca/`.
+- Owner selects `mode: orca` or `mode: neutral` in a request; explicit request
+  mode overrides this default.
+- Read `orchestration/orca/RUNBOOK.md` before using Orca mode. Do not invoke
+  Orca for a neutral task.
+
 ## Skill: planning-with-files (when available)
 
 When `planning-with-files` is available in the current environment, use it for
