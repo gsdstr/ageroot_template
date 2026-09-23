@@ -98,6 +98,7 @@ Do not read during normal agent startup. Read this section only when configuring
 installing, or updating Ageroot.
 
 Follow [`SETUP.md`](SETUP.md) for Ageroot configuration and update protocol.
+Template repository: https://github.com/gsdstr/ageroot_template
 
 ### Skills
 
